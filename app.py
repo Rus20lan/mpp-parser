@@ -1,18 +1,13 @@
 """
 MPP Parser Microservice
 =======================
-FastAPI service that accepts .mpp files (Microsoft Project)
+FastAPI service that parses .mpp files via the mpxj Python package
 and returns structured JSON with full task hierarchy.
 
-Uses MPXJ library via JPype for reliable .mpp parsing.
-Designed for deployment on Hugging Face Spaces (Docker SDK, port 7860).
-
-Target consumer: Claude.ai SKILL for R&D Change Log agent.
+Deployed on Hugging Face Spaces (Docker SDK, port 7860).
 """
 
 import os
-import io
-import json
 import tempfile
 import traceback
 from datetime import datetime, date
@@ -22,33 +17,15 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-import jpype
-import jpype.imports
-
-# ---------------------------------------------------------------------------
-# JVM startup (once per process)
-# ---------------------------------------------------------------------------
-MPXJ_JAR = "/app/lib/mpxj.jar"
-
-if not jpype.isJVMStarted():
-    jpype.startJVM(
-        classpath=[MPXJ_JAR],
-        convertStrings=True,          # auto-convert Java strings to Python str
-    )
-
-from net.sf.mpxj.reader import UniversalProjectReader   # type: ignore
-from java.io import FileInputStream                       # type: ignore
+from mpxj import ProjectReader
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="MPP Parser for R&D Change Log",
-    version="1.0.0",
-    description=(
-        "Parses Microsoft Project .mpp files and returns JSON "
-        "with tasks, dates, resources, costs, and hierarchy."
-    ),
+    version="1.1.0",
+    description="Parses .mpp files → JSON with tasks, dates, resources, costs, hierarchy.",
 )
 
 app.add_middleware(
@@ -63,52 +40,56 @@ app.add_middleware(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _java_date_to_iso(jdate) -> Optional[str]:
-    """Convert a Java Date / LocalDateTime to ISO string, or None."""
-    if jdate is None:
+def _to_iso(val) -> Optional[str]:
+    """Convert date/datetime to ISO string YYYY-MM-DD."""
+    if val is None:
         return None
     try:
-        # MPXJ 13+ returns java.time.LocalDateTime for some fields
-        return str(jdate)[:10]   # YYYY-MM-DD
+        if isinstance(val, (date, datetime)):
+            return val.strftime("%Y-%m-%d")
+        return str(val)[:10]
     except Exception:
-        try:
-            ts = jdate.getTime() / 1000.0
-            return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-        except Exception:
-            return str(jdate)
+        return str(val)
 
 
 def _safe_str(val) -> Optional[str]:
     if val is None:
         return None
-    return str(val).strip() or None
+    s = str(val).strip()
+    return s if s else None
 
 
 def _safe_float(val) -> Optional[float]:
     if val is None:
         return None
     try:
-        return float(str(val))
+        return float(val)
     except (ValueError, TypeError):
-        return None
+        try:
+            return float(str(val))
+        except (ValueError, TypeError):
+            return None
 
 
 def _safe_int(val) -> Optional[int]:
     if val is None:
         return None
     try:
-        return int(float(str(val)))
+        return int(val)
     except (ValueError, TypeError):
-        return None
+        try:
+            return int(float(str(val)))
+        except (ValueError, TypeError):
+            return None
 
 
 def _duration_to_str(dur) -> Optional[str]:
-    """MPXJ Duration → human-readable string like '5d', '12h'."""
+    """Duration object → string like '5.0d', '12.0h'."""
     if dur is None:
         return None
     try:
-        amount = dur.getDuration()
-        units = str(dur.getUnits())
+        amount = dur.duration
+        units = str(dur.units)
         unit_map = {
             "DAYS": "d", "HOURS": "h", "WEEKS": "w",
             "MONTHS": "mo", "MINUTES": "min", "YEARS": "y",
@@ -120,113 +101,88 @@ def _duration_to_str(dur) -> Optional[str]:
         return str(dur)
 
 
-def _extract_predecessors(task) -> list[dict]:
+def _extract_predecessors(task) -> list:
     """Return list of {task_uid, type, lag} for each predecessor."""
     preds = []
     try:
-        relations = task.getPredecessors()
-        if relations is None:
+        relations = task.predecessors
+        if not relations:
             return preds
         for rel in relations:
-            pred_task = rel.getTargetTask()
+            pred_task = rel.target_task
             preds.append({
-                "task_uid": _safe_int(pred_task.getUniqueID()) if pred_task else None,
-                "type": _safe_str(rel.getType()),
-                "lag": _duration_to_str(rel.getLag()),
+                "task_uid": _safe_int(pred_task.unique_id) if pred_task else None,
+                "type": _safe_str(rel.type),
+                "lag": _duration_to_str(rel.lag),
             })
     except Exception:
         pass
     return preds
 
 
-def _extract_resources(task) -> list[dict]:
+def _extract_resources(task) -> list:
     """Return resource assignments for a task."""
     assignments = []
     try:
-        for ra in task.getResourceAssignments():
-            res = ra.getResource()
+        for ra in task.resource_assignments:
+            res = ra.resource
             assignments.append({
-                "resource_name": _safe_str(res.getName()) if res else None,
-                "resource_uid": _safe_int(res.getUniqueID()) if res else None,
-                "work": _duration_to_str(ra.getWork()),
-                "units": _safe_float(ra.getUnits()),
-                "cost": _safe_float(ra.getCost()),
+                "resource_name": _safe_str(res.name) if res else None,
+                "resource_uid": _safe_int(res.unique_id) if res else None,
+                "work": _duration_to_str(ra.work),
+                "units": _safe_float(ra.units),
+                "cost": _safe_float(ra.cost),
             })
     except Exception:
         pass
     return assignments
 
 
-def _get_outline_level(task) -> Optional[int]:
+def _has_children(task) -> bool:
     try:
-        return _safe_int(task.getOutlineLevel())
-    except Exception:
-        return None
-
-
-def _get_wbs(task) -> Optional[str]:
-    try:
-        return _safe_str(task.getWBS())
-    except Exception:
-        return None
-
-
-def _is_milestone(task) -> bool:
-    try:
-        return bool(task.getMilestone())
+        children = task.child_tasks
+        return children is not None and len(children) > 0
     except Exception:
         return False
 
 
-def _is_summary(task) -> bool:
+def _is_milestone(task) -> bool:
     try:
-        # MPXJ: summary tasks have child tasks
-        children = task.getChildTasks()
-        return children is not None and children.size() > 0
+        return bool(task.milestone)
     except Exception:
         return False
 
 
 def _get_parent_uid(task) -> Optional[int]:
     try:
-        parent = task.getParentTask()
+        parent = task.parent_task
         if parent is not None:
-            uid = parent.getUniqueID()
-            return _safe_int(uid) if uid else None
+            return _safe_int(parent.unique_id)
     except Exception:
         pass
     return None
 
 
-def _extract_notes(task) -> Optional[str]:
+def _get_notes(task) -> Optional[str]:
     try:
-        notes = task.getNotes()
+        notes = task.notes
         if notes:
-            return str(notes).strip() or None
+            s = str(notes).strip()
+            return s if s else None
     except Exception:
         pass
     return None
 
 
-# Custom / extended fields commonly used in R&D project exports
-# MS Project "Text1"…"Text30" often carry domain-specific data.
-def _extract_custom_text_fields(task, field_count: int = 10) -> dict:
-    """Extract Text1…TextN custom fields (used for Control_Level etc.)."""
-    result = {}
+def _get_custom_text(task, field_name: str) -> Optional[str]:
+    """Try to read a custom text field by attribute name."""
     try:
-        from net.sf.mpxj import TaskField  # type: ignore
-        for i in range(1, field_count + 1):
-            field_name = f"TEXT{i}"
-            try:
-                field = TaskField.valueOf(field_name)
-                val = task.getCachedValue(field)
-                if val is not None:
-                    result[f"text{i}"] = str(val).strip()
-            except Exception:
-                pass
+        val = getattr(task, field_name, None)
+        if val is not None:
+            return str(val).strip() or None
     except Exception:
         pass
-    return result
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -234,121 +190,107 @@ def _extract_custom_text_fields(task, field_count: int = 10) -> dict:
 # ---------------------------------------------------------------------------
 
 def parse_mpp(file_path: str) -> dict:
-    """
-    Parse an .mpp file and return a dict with:
-      - project_name
-      - report_date
-      - tasks: list of task dicts
-      - resources: list of project-level resources
-      - summary: basic stats
-    """
-    reader = UniversalProjectReader()
-    fis = FileInputStream(file_path)
-    project = reader.read(fis)
-    fis.close()
+    """Parse .mpp → dict with project metadata, tasks, resources, summary."""
+
+    reader = ProjectReader()
+    project = reader.read(file_path)
 
     if project is None:
-        raise ValueError("MPXJ returned None — file may be corrupt or unsupported format.")
+        raise ValueError("MPXJ returned None — file may be corrupt or unsupported.")
 
-    # Project-level metadata
-    props = project.getProjectProperties()
-    project_name = _safe_str(props.getProjectTitle()) or _safe_str(props.getName()) or "Untitled"
-    status_date = _java_date_to_iso(props.getStatusDate())
-    start_date = _java_date_to_iso(props.getStartDate())
-    finish_date = _java_date_to_iso(props.getFinishDate())
-    baseline_date = _java_date_to_iso(props.getBaselineDate()) if hasattr(props, 'getBaselineDate') else None
+    # --- Project metadata ---
+    props = project.project_properties
+    project_name = _safe_str(getattr(props, 'project_title', None)) \
+                   or _safe_str(getattr(props, 'name', None)) \
+                   or "Untitled"
+    status_date = _to_iso(getattr(props, 'status_date', None))
+    start_date = _to_iso(getattr(props, 'start_date', None))
+    finish_date = _to_iso(getattr(props, 'finish_date', None))
+    baseline_date = _to_iso(getattr(props, 'baseline_date', None))
 
     # --- Tasks ---
     tasks_out = []
-    all_tasks = project.getTasks()
-
-    for task in all_tasks:
-        uid = _safe_int(task.getUniqueID())
+    for task in project.tasks:
+        uid = _safe_int(task.unique_id)
         if uid is None or uid == 0:
-            continue  # skip project summary (UID=0)
+            continue  # skip project summary row
+
+        is_summary = _has_children(task)
 
         task_dict = {
-            # Identity
-            "unique_id":       uid,
-            "id":              _safe_int(task.getID()),
-            "wbs":             _get_wbs(task),
-            "name":            _safe_str(task.getName()),
-            "outline_level":   _get_outline_level(task),
-            "parent_uid":      _get_parent_uid(task),
-            "is_summary":      _is_summary(task),
-            "is_milestone":    _is_milestone(task),
+            "unique_id":        uid,
+            "id":               _safe_int(task.id),
+            "wbs":              _safe_str(getattr(task, 'wbs', None)),
+            "name":             _safe_str(task.name),
+            "outline_level":    _safe_int(getattr(task, 'outline_level', None)),
+            "parent_uid":       _get_parent_uid(task),
+            "is_summary":       is_summary,
+            "is_milestone":     _is_milestone(task),
 
-            # Dates — current forecast
-            "start":           _java_date_to_iso(task.getStart()),
-            "finish":          _java_date_to_iso(task.getFinish()),
+            "start":            _to_iso(task.start),
+            "finish":           _to_iso(task.finish),
+            "baseline_start":   _to_iso(getattr(task, 'baseline_start', None)),
+            "baseline_finish":  _to_iso(getattr(task, 'baseline_finish', None)),
 
-            # Dates — baseline
-            "baseline_start":  _java_date_to_iso(task.getBaselineStart()),
-            "baseline_finish": _java_date_to_iso(task.getBaselineFinish()),
+            "duration":         _duration_to_str(getattr(task, 'duration', None)),
+            "percent_complete": _safe_float(getattr(task, 'percentage_complete', None)),
+            "actual_start":     _to_iso(getattr(task, 'actual_start', None)),
+            "actual_finish":    _to_iso(getattr(task, 'actual_finish', None)),
 
-            # Duration & progress
-            "duration":        _duration_to_str(task.getDuration()),
-            "percent_complete": _safe_float(task.getPercentageComplete()),
-            "actual_start":    _java_date_to_iso(task.getActualStart()),
-            "actual_finish":   _java_date_to_iso(task.getActualFinish()),
+            "cost":             _safe_float(getattr(task, 'cost', None)),
+            "baseline_cost":    _safe_float(getattr(task, 'baseline_cost', None)),
+            "work":             _duration_to_str(getattr(task, 'work', None)),
+            "baseline_work":    _duration_to_str(getattr(task, 'baseline_work', None)),
 
-            # Cost & work
-            "cost":            _safe_float(task.getCost()),
-            "baseline_cost":   _safe_float(task.getBaselineCost()),
-            "work":            _duration_to_str(task.getWork()),
-            "baseline_work":   _duration_to_str(task.getBaselineWork()),
+            "predecessors":     _extract_predecessors(task),
+            "resources":        _extract_resources(task),
+            "notes":            _get_notes(task),
 
-            # Dependencies
-            "predecessors":    _extract_predecessors(task),
-
-            # Resources assigned
-            "resources":       _extract_resources(task),
-
-            # Notes
-            "notes":           _extract_notes(task),
-
-            # Custom text fields (Text1…Text10)
-            "custom_fields":   _extract_custom_text_fields(task),
+            "custom_fields": {
+                "text1": _get_custom_text(task, 'text1'),
+                "text2": _get_custom_text(task, 'text2'),
+                "text3": _get_custom_text(task, 'text3'),
+            },
         }
         tasks_out.append(task_dict)
 
-    # --- Project-level resources list ---
+    # --- Resources ---
     resources_out = []
     try:
-        for res in project.getResources():
-            res_uid = _safe_int(res.getUniqueID())
+        for res in project.resources:
+            res_uid = _safe_int(res.unique_id)
             if res_uid is None or res_uid == 0:
                 continue
             resources_out.append({
-                "unique_id":   res_uid,
-                "name":        _safe_str(res.getName()),
-                "type":        _safe_str(res.getType()),
-                "cost":        _safe_float(res.getCost()),
-                "email":       _safe_str(res.getEmailAddress()) if hasattr(res, 'getEmailAddress') else None,
+                "unique_id": res_uid,
+                "name":      _safe_str(res.name),
+                "type":      _safe_str(getattr(res, 'type', None)),
+                "cost":      _safe_float(getattr(res, 'cost', None)),
+                "email":     _safe_str(getattr(res, 'email_address', None)),
             })
     except Exception:
         pass
 
-    # --- Summary ---
+    # --- Summary stats ---
     summary = {
-        "total_tasks":      len(tasks_out),
-        "summary_tasks":    sum(1 for t in tasks_out if t["is_summary"]),
-        "milestones":       sum(1 for t in tasks_out if t["is_milestone"]),
-        "leaf_tasks":       sum(1 for t in tasks_out if not t["is_summary"] and not t["is_milestone"]),
-        "with_baseline":    sum(1 for t in tasks_out if t["baseline_finish"] is not None),
+        "total_tasks":     len(tasks_out),
+        "summary_tasks":   sum(1 for t in tasks_out if t["is_summary"]),
+        "milestones":      sum(1 for t in tasks_out if t["is_milestone"]),
+        "leaf_tasks":      sum(1 for t in tasks_out if not t["is_summary"] and not t["is_milestone"]),
+        "with_baseline":   sum(1 for t in tasks_out if t["baseline_finish"] is not None),
         "total_resources":  len(resources_out),
     }
 
     return {
-        "project_name":  project_name,
-        "status_date":   status_date,
-        "start_date":    start_date,
-        "finish_date":   finish_date,
-        "baseline_date": baseline_date,
+        "project_name":    project_name,
+        "status_date":     status_date,
+        "start_date":      start_date,
+        "finish_date":     finish_date,
+        "baseline_date":   baseline_date,
         "parse_timestamp": datetime.utcnow().isoformat() + "Z",
-        "summary":       summary,
-        "tasks":         tasks_out,
-        "resources":     resources_out,
+        "summary":         summary,
+        "tasks":           tasks_out,
+        "resources":       resources_out,
     }
 
 
@@ -360,7 +302,7 @@ def parse_mpp(file_path: str) -> dict:
 async def root():
     return {
         "service": "MPP Parser for R&D Change Log",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "running",
         "usage": "POST /parse with file=<your.mpp>",
     }
@@ -368,30 +310,20 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "jvm": jpype.isJVMStarted()}
+    return {"status": "ok"}
 
 
 @app.post("/parse")
-async def parse_file(file: UploadFile = File(...)):
-    """
-    Accept an .mpp file upload, parse it via MPXJ, return JSON.
-
-    Returns:
-        JSON with project metadata, tasks array, resources array, and summary stats.
-    """
+async def parse_endpoint(file: UploadFile = File(...)):
+    """Full parse — nested JSON with tasks, resources, predecessors."""
     if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided.")
+        raise HTTPException(400, "No file provided.")
 
-    # Accept .mpp, .mpt, .mpx, .xml (MPXJ supports several formats)
-    allowed_ext = (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml")
+    allowed = (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml")
     ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed_ext:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(allowed_ext)}"
-        )
+    if ext not in allowed:
+        raise HTTPException(400, f"Unsupported '{ext}'. Allowed: {', '.join(allowed)}")
 
-    # Save upload to temp file (MPXJ needs a file path)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     try:
         content = await file.read()
@@ -401,15 +333,11 @@ async def parse_file(file: UploadFile = File(...)):
 
         result = parse_mpp(tmp.name)
         return JSONResponse(content=result)
-
     except ValueError as ve:
-        raise HTTPException(status_code=422, detail=str(ve))
+        raise HTTPException(422, str(ve))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Parse error: {type(e).__name__}: {str(e)}"
-        )
+        raise HTTPException(500, f"Parse error: {type(e).__name__}: {e}")
     finally:
         try:
             os.unlink(tmp.name)
@@ -418,18 +346,14 @@ async def parse_file(file: UploadFile = File(...)):
 
 
 @app.post("/parse/compact")
-async def parse_file_compact(file: UploadFile = File(...)):
-    """
-    Same as /parse but returns a flattened table-ready format
-    (one dict per task, no nested objects) suitable for direct
-    insertion into Google Sheets.
-    """
+async def parse_compact(file: UploadFile = File(...)):
+    """Flat table-ready format for Google Sheets."""
     if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided.")
+        raise HTTPException(400, "No file provided.")
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml"):
-        raise HTTPException(status_code=400, detail=f"Unsupported file type '{ext}'.")
+        raise HTTPException(400, f"Unsupported '{ext}'.")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     try:
@@ -440,70 +364,41 @@ async def parse_file_compact(file: UploadFile = File(...)):
 
         full = parse_mpp(tmp.name)
 
-        # Flatten tasks for spreadsheet
         rows = []
         for t in full["tasks"]:
-            # Predecessors → comma-separated UIDs
             pred_str = ", ".join(
-                str(p.get("task_uid", ""))
-                for p in (t.get("predecessors") or [])
+                str(p["task_uid"]) for p in (t.get("predecessors") or [])
                 if p.get("task_uid") is not None
             )
-            # Resources → comma-separated names
             res_str = ", ".join(
-                r.get("resource_name", "") or ""
+                r.get("resource_name") or ""
                 for r in (t.get("resources") or [])
             )
-            # Custom text fields → concatenated
             custom = t.get("custom_fields") or {}
-            control_level = custom.get("text1", "")  # Convention: Text1 = Control Level
 
             rows.append({
-                "UID":              t["unique_id"],
-                "ID":               t["id"],
-                "WBS":              t["wbs"] or "",
-                "Название":         t["name"] or "",
-                "Уровень":          control_level,
-                "Уровень_WBS":      t["outline_level"],
-                "Родитель_UID":     t["parent_uid"] or "",
-                "Суммарная":        "Да" if t["is_summary"] else "Нет",
-                "Веха":             "Да" if t["is_milestone"] else "Нет",
-                "Начало":           t["start"] or "",
-                "Окончание":        t["finish"] or "",
-                "Базовое_начало":   t["baseline_start"] or "",
-                "Базовое_окончание": t["baseline_finish"] or "",
-                "Длительность":     t["duration"] or "",
-                "Процент_выполнения": t["percent_complete"] or 0,
-                "Факт_начало":      t["actual_start"] or "",
-                "Факт_окончание":   t["actual_finish"] or "",
-                "Стоимость":        t["cost"] or "",
-                "Базовая_стоимость": t["baseline_cost"] or "",
-                "Трудозатраты":     t["work"] or "",
+                "UID":                  t["unique_id"],
+                "ID":                   t["id"],
+                "WBS":                  t["wbs"] or "",
+                "Название":             t["name"] or "",
+                "Уровень":              custom.get("text1") or "",
+                "Уровень_WBS":          t["outline_level"],
+                "Родитель_UID":         t["parent_uid"] or "",
+                "Суммарная":            "Да" if t["is_summary"] else "Нет",
+                "Веха":                 "Да" if t["is_milestone"] else "Нет",
+                "Начало":               t["start"] or "",
+                "Окончание":            t["finish"] or "",
+                "Базовое_начало":       t["baseline_start"] or "",
+                "Базовое_окончание":    t["baseline_finish"] or "",
+                "Длительность":         t["duration"] or "",
+                "Процент_выполнения":   t["percent_complete"] or 0,
+                "Факт_начало":          t["actual_start"] or "",
+                "Факт_окончание":       t["actual_finish"] or "",
+                "Стоимость":            t["cost"] or "",
+                "Базовая_стоимость":    t["baseline_cost"] or "",
+                "Трудозатраты":         t["work"] or "",
                 "Базовые_трудозатраты": t["baseline_work"] or "",
-                "Предшественники":  pred_str,
-                "Ресурсы":          res_str,
-                "Заметки":          t["notes"] or "",
+                "Предшественники":      pred_str,
+                "Ресурсы":              res_str,
+                "Заметки":              t["notes"] or "",
             })
-
-        return JSONResponse(content={
-            "project_name":    full["project_name"],
-            "status_date":     full["status_date"],
-            "start_date":      full["start_date"],
-            "finish_date":     full["finish_date"],
-            "baseline_date":   full["baseline_date"],
-            "parse_timestamp": full["parse_timestamp"],
-            "summary":         full["summary"],
-            "columns": list(rows[0].keys()) if rows else [],
-            "rows":            rows,
-        })
-
-    except ValueError as ve:
-        raise HTTPException(status_code=422, detail=str(ve))
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Parse error: {type(e).__name__}: {str(e)}")
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
