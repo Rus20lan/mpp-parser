@@ -19,13 +19,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from mpxj import ProjectReader
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="MPP Parser for R&D Change Log",
     version="1.1.0",
-    description="Parses .mpp files → JSON with tasks, dates, resources, costs, hierarchy.",
+    description="Parses .mpp files and returns JSON with tasks, dates, resources, costs, hierarchy.",
 )
 
 app.add_middleware(
@@ -36,12 +33,7 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _to_iso(val) -> Optional[str]:
-    """Convert date/datetime to ISO string YYYY-MM-DD."""
+def _to_iso(val):
     if val is None:
         return None
     try:
@@ -52,14 +44,14 @@ def _to_iso(val) -> Optional[str]:
         return str(val)
 
 
-def _safe_str(val) -> Optional[str]:
+def _safe_str(val):
     if val is None:
         return None
     s = str(val).strip()
     return s if s else None
 
 
-def _safe_float(val) -> Optional[float]:
+def _safe_float(val):
     if val is None:
         return None
     try:
@@ -71,7 +63,7 @@ def _safe_float(val) -> Optional[float]:
             return None
 
 
-def _safe_int(val) -> Optional[int]:
+def _safe_int(val):
     if val is None:
         return None
     try:
@@ -83,26 +75,29 @@ def _safe_int(val) -> Optional[int]:
             return None
 
 
-def _duration_to_str(dur) -> Optional[str]:
-    """Duration object → string like '5.0d', '12.0h'."""
+def _duration_to_str(dur):
     if dur is None:
         return None
     try:
         amount = dur.duration
         units = str(dur.units)
         unit_map = {
-            "DAYS": "d", "HOURS": "h", "WEEKS": "w",
-            "MONTHS": "mo", "MINUTES": "min", "YEARS": "y",
-            "ELAPSED_DAYS": "ed", "ELAPSED_HOURS": "eh",
+            "DAYS": "d",
+            "HOURS": "h",
+            "WEEKS": "w",
+            "MONTHS": "mo",
+            "MINUTES": "min",
+            "YEARS": "y",
+            "ELAPSED_DAYS": "ed",
+            "ELAPSED_HOURS": "eh",
         }
         suffix = unit_map.get(units, units)
-        return f"{amount}{suffix}"
+        return str(amount) + suffix
     except Exception:
         return str(dur)
 
 
-def _extract_predecessors(task) -> list:
-    """Return list of {task_uid, type, lag} for each predecessor."""
+def _extract_predecessors(task):
     preds = []
     try:
         relations = task.predecessors
@@ -120,8 +115,7 @@ def _extract_predecessors(task) -> list:
     return preds
 
 
-def _extract_resources(task) -> list:
-    """Return resource assignments for a task."""
+def _extract_resources(task):
     assignments = []
     try:
         for ra in task.resource_assignments:
@@ -138,7 +132,7 @@ def _extract_resources(task) -> list:
     return assignments
 
 
-def _has_children(task) -> bool:
+def _has_children(task):
     try:
         children = task.child_tasks
         return children is not None and len(children) > 0
@@ -146,14 +140,14 @@ def _has_children(task) -> bool:
         return False
 
 
-def _is_milestone(task) -> bool:
+def _is_milestone(task):
     try:
         return bool(task.milestone)
     except Exception:
         return False
 
 
-def _get_parent_uid(task) -> Optional[int]:
+def _get_parent_uid(task):
     try:
         parent = task.parent_task
         if parent is not None:
@@ -163,7 +157,7 @@ def _get_parent_uid(task) -> Optional[int]:
     return None
 
 
-def _get_notes(task) -> Optional[str]:
+def _get_notes(task):
     try:
         notes = task.notes
         if notes:
@@ -174,8 +168,7 @@ def _get_notes(task) -> Optional[str]:
     return None
 
 
-def _get_custom_text(task, field_name: str) -> Optional[str]:
-    """Try to read a custom text field by attribute name."""
+def _get_custom_text(task, field_name):
     try:
         val = getattr(task, field_name, None)
         if val is not None:
@@ -185,67 +178,57 @@ def _get_custom_text(task, field_name: str) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Core parse logic
-# ---------------------------------------------------------------------------
-
-def parse_mpp(file_path: str) -> dict:
-    """Parse .mpp → dict with project metadata, tasks, resources, summary."""
-
+def parse_mpp(file_path):
     reader = ProjectReader()
     project = reader.read(file_path)
 
     if project is None:
-        raise ValueError("MPXJ returned None — file may be corrupt or unsupported.")
+        raise ValueError("MPXJ returned None. File may be corrupt or unsupported.")
 
-    # --- Project metadata ---
     props = project.project_properties
-    project_name = _safe_str(getattr(props, 'project_title', None)) \
-                   or _safe_str(getattr(props, 'name', None)) \
-                   or "Untitled"
+    project_name = _safe_str(getattr(props, 'project_title', None))
+    if not project_name:
+        project_name = _safe_str(getattr(props, 'name', None))
+    if not project_name:
+        project_name = "Untitled"
+
     status_date = _to_iso(getattr(props, 'status_date', None))
     start_date = _to_iso(getattr(props, 'start_date', None))
     finish_date = _to_iso(getattr(props, 'finish_date', None))
     baseline_date = _to_iso(getattr(props, 'baseline_date', None))
 
-    # --- Tasks ---
     tasks_out = []
     for task in project.tasks:
         uid = _safe_int(task.unique_id)
         if uid is None or uid == 0:
-            continue  # skip project summary row
+            continue
 
         is_summary = _has_children(task)
 
         task_dict = {
-            "unique_id":        uid,
-            "id":               _safe_int(task.id),
-            "wbs":              _safe_str(getattr(task, 'wbs', None)),
-            "name":             _safe_str(task.name),
-            "outline_level":    _safe_int(getattr(task, 'outline_level', None)),
-            "parent_uid":       _get_parent_uid(task),
-            "is_summary":       is_summary,
-            "is_milestone":     _is_milestone(task),
-
-            "start":            _to_iso(task.start),
-            "finish":           _to_iso(task.finish),
-            "baseline_start":   _to_iso(getattr(task, 'baseline_start', None)),
-            "baseline_finish":  _to_iso(getattr(task, 'baseline_finish', None)),
-
-            "duration":         _duration_to_str(getattr(task, 'duration', None)),
+            "unique_id": uid,
+            "id": _safe_int(task.id),
+            "wbs": _safe_str(getattr(task, 'wbs', None)),
+            "name": _safe_str(task.name),
+            "outline_level": _safe_int(getattr(task, 'outline_level', None)),
+            "parent_uid": _get_parent_uid(task),
+            "is_summary": is_summary,
+            "is_milestone": _is_milestone(task),
+            "start": _to_iso(task.start),
+            "finish": _to_iso(task.finish),
+            "baseline_start": _to_iso(getattr(task, 'baseline_start', None)),
+            "baseline_finish": _to_iso(getattr(task, 'baseline_finish', None)),
+            "duration": _duration_to_str(getattr(task, 'duration', None)),
             "percent_complete": _safe_float(getattr(task, 'percentage_complete', None)),
-            "actual_start":     _to_iso(getattr(task, 'actual_start', None)),
-            "actual_finish":    _to_iso(getattr(task, 'actual_finish', None)),
-
-            "cost":             _safe_float(getattr(task, 'cost', None)),
-            "baseline_cost":    _safe_float(getattr(task, 'baseline_cost', None)),
-            "work":             _duration_to_str(getattr(task, 'work', None)),
-            "baseline_work":    _duration_to_str(getattr(task, 'baseline_work', None)),
-
-            "predecessors":     _extract_predecessors(task),
-            "resources":        _extract_resources(task),
-            "notes":            _get_notes(task),
-
+            "actual_start": _to_iso(getattr(task, 'actual_start', None)),
+            "actual_finish": _to_iso(getattr(task, 'actual_finish', None)),
+            "cost": _safe_float(getattr(task, 'cost', None)),
+            "baseline_cost": _safe_float(getattr(task, 'baseline_cost', None)),
+            "work": _duration_to_str(getattr(task, 'work', None)),
+            "baseline_work": _duration_to_str(getattr(task, 'baseline_work', None)),
+            "predecessors": _extract_predecessors(task),
+            "resources": _extract_resources(task),
+            "notes": _get_notes(task),
             "custom_fields": {
                 "text1": _get_custom_text(task, 'text1'),
                 "text2": _get_custom_text(task, 'text2'),
@@ -254,7 +237,6 @@ def parse_mpp(file_path: str) -> dict:
         }
         tasks_out.append(task_dict)
 
-    # --- Resources ---
     resources_out = []
     try:
         for res in project.resources:
@@ -263,40 +245,35 @@ def parse_mpp(file_path: str) -> dict:
                 continue
             resources_out.append({
                 "unique_id": res_uid,
-                "name":      _safe_str(res.name),
-                "type":      _safe_str(getattr(res, 'type', None)),
-                "cost":      _safe_float(getattr(res, 'cost', None)),
-                "email":     _safe_str(getattr(res, 'email_address', None)),
+                "name": _safe_str(res.name),
+                "type": _safe_str(getattr(res, 'type', None)),
+                "cost": _safe_float(getattr(res, 'cost', None)),
+                "email": _safe_str(getattr(res, 'email_address', None)),
             })
     except Exception:
         pass
 
-    # --- Summary stats ---
     summary = {
-        "total_tasks":     len(tasks_out),
-        "summary_tasks":   sum(1 for t in tasks_out if t["is_summary"]),
-        "milestones":      sum(1 for t in tasks_out if t["is_milestone"]),
-        "leaf_tasks":      sum(1 for t in tasks_out if not t["is_summary"] and not t["is_milestone"]),
-        "with_baseline":   sum(1 for t in tasks_out if t["baseline_finish"] is not None),
-        "total_resources":  len(resources_out),
+        "total_tasks": len(tasks_out),
+        "summary_tasks": sum(1 for t in tasks_out if t["is_summary"]),
+        "milestones": sum(1 for t in tasks_out if t["is_milestone"]),
+        "leaf_tasks": sum(1 for t in tasks_out if not t["is_summary"] and not t["is_milestone"]),
+        "with_baseline": sum(1 for t in tasks_out if t["baseline_finish"] is not None),
+        "total_resources": len(resources_out),
     }
 
     return {
-        "project_name":    project_name,
-        "status_date":     status_date,
-        "start_date":      start_date,
-        "finish_date":     finish_date,
-        "baseline_date":   baseline_date,
+        "project_name": project_name,
+        "status_date": status_date,
+        "start_date": start_date,
+        "finish_date": finish_date,
+        "baseline_date": baseline_date,
         "parse_timestamp": datetime.utcnow().isoformat() + "Z",
-        "summary":         summary,
-        "tasks":           tasks_out,
-        "resources":       resources_out,
+        "summary": summary,
+        "tasks": tasks_out,
+        "resources": resources_out,
     }
 
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/")
 async def root():
@@ -315,14 +292,13 @@ async def health():
 
 @app.post("/parse")
 async def parse_endpoint(file: UploadFile = File(...)):
-    """Full parse — nested JSON with tasks, resources, predecessors."""
     if not file.filename:
         raise HTTPException(400, "No file provided.")
 
     allowed = (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml")
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in allowed:
-        raise HTTPException(400, f"Unsupported '{ext}'. Allowed: {', '.join(allowed)}")
+        raise HTTPException(400, "Unsupported file type: " + ext)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     try:
@@ -330,14 +306,13 @@ async def parse_endpoint(file: UploadFile = File(...)):
         tmp.write(content)
         tmp.flush()
         tmp.close()
-
         result = parse_mpp(tmp.name)
         return JSONResponse(content=result)
     except ValueError as ve:
         raise HTTPException(422, str(ve))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(500, f"Parse error: {type(e).__name__}: {e}")
+        raise HTTPException(500, "Parse error: " + str(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -347,13 +322,13 @@ async def parse_endpoint(file: UploadFile = File(...)):
 
 @app.post("/parse/compact")
 async def parse_compact(file: UploadFile = File(...)):
-    """Flat table-ready format for Google Sheets."""
     if not file.filename:
         raise HTTPException(400, "No file provided.")
 
+    allowed = (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml")
     ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml"):
-        raise HTTPException(400, f"Unsupported '{ext}'.")
+    if ext not in allowed:
+        raise HTTPException(400, "Unsupported file type: " + ext)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     try:
@@ -361,13 +336,13 @@ async def parse_compact(file: UploadFile = File(...)):
         tmp.write(content)
         tmp.flush()
         tmp.close()
-
         full = parse_mpp(tmp.name)
 
         rows = []
         for t in full["tasks"]:
             pred_str = ", ".join(
-                str(p["task_uid"]) for p in (t.get("predecessors") or [])
+                str(p["task_uid"])
+                for p in (t.get("predecessors") or [])
                 if p.get("task_uid") is not None
             )
             res_str = ", ".join(
@@ -376,29 +351,55 @@ async def parse_compact(file: UploadFile = File(...)):
             )
             custom = t.get("custom_fields") or {}
 
-            rows.append({
-                "UID":                  t["unique_id"],
-                "ID":                   t["id"],
-                "WBS":                  t["wbs"] or "",
-                "Название":             t["name"] or "",
-                "Уровень":              custom.get("text1") or "",
-                "Уровень_WBS":          t["outline_level"],
-                "Родитель_UID":         t["parent_uid"] or "",
-                "Суммарная":            "Да" if t["is_summary"] else "Нет",
-                "Веха":                 "Да" if t["is_milestone"] else "Нет",
-                "Начало":               t["start"] or "",
-                "Окончание":            t["finish"] or "",
-                "Базовое_начало":       t["baseline_start"] or "",
-                "Базовое_окончание":    t["baseline_finish"] or "",
-                "Длительность":         t["duration"] or "",
-                "Процент_выполнения":   t["percent_complete"] or 0,
-                "Факт_начало":          t["actual_start"] or "",
-                "Факт_окончание":       t["actual_finish"] or "",
-                "Стоимость":            t["cost"] or "",
-                "Базовая_стоимость":    t["baseline_cost"] or "",
-                "Трудозатраты":         t["work"] or "",
+            row = {
+                "UID": t["unique_id"],
+                "ID": t["id"],
+                "WBS": t["wbs"] or "",
+                "Название": t["name"] or "",
+                "Уровень": custom.get("text1") or "",
+                "Уровень_WBS": t["outline_level"],
+                "Родитель_UID": t["parent_uid"] or "",
+                "Суммарная": "Да" if t["is_summary"] else "Нет",
+                "Веха": "Да" if t["is_milestone"] else "Нет",
+                "Начало": t["start"] or "",
+                "Окончание": t["finish"] or "",
+                "Базовое_начало": t["baseline_start"] or "",
+                "Базовое_окончание": t["baseline_finish"] or "",
+                "Длительность": t["duration"] or "",
+                "Процент_выполнения": t["percent_complete"] or 0,
+                "Факт_начало": t["actual_start"] or "",
+                "Факт_окончание": t["actual_finish"] or "",
+                "Стоимость": t["cost"] or "",
+                "Базовая_стоимость": t["baseline_cost"] or "",
+                "Трудозатраты": t["work"] or "",
                 "Базовые_трудозатраты": t["baseline_work"] or "",
-                "Предшественники":      pred_str,
-                "Ресурсы":              res_str,
-                "Заметки":              t["notes"] or "",
-            })
+                "Предшественники": pred_str,
+                "Ресурсы": res_str,
+                "Заметки": t["notes"] or "",
+            }
+            rows.append(row)
+
+        columns = list(rows[0].keys()) if rows else []
+
+        result = {
+            "project_name": full["project_name"],
+            "status_date": full["status_date"],
+            "start_date": full["start_date"],
+            "finish_date": full["finish_date"],
+            "baseline_date": full["baseline_date"],
+            "parse_timestamp": full["parse_timestamp"],
+            "summary": full["summary"],
+            "columns": columns,
+            "rows": rows,
+        }
+        return JSONResponse(content=result)
+    except ValueError as ve:
+        raise HTTPException(422, str(ve))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, "Parse error: " + str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
