@@ -1,0 +1,22 @@
+name: Deploy to HF Spaces
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  sync-to-hf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add hf https://ruslan1820:$HF_TOKEN@huggingface.co/spaces/ruslan1820/mpp-parser
+          git push hf main --force
