@@ -1,7 +1,7 @@
 """
 MPP Parser Microservice — JPype + MPXJ (Maven JARs)
-Patched: safe handling of java.util.UUID and other non-standard MPXJ types
 """
+
 import os
 import glob
 import tempfile
@@ -28,6 +28,7 @@ app = FastAPI(
     title="MPP Parser for R&D Change Log",
     version="1.3.0",
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,51 +36,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ────────────────────────────────────────────
-#  FIX: Universal safe getter for MPXJ values
-# ────────────────────────────────────────────
-def _safe_call(func, *args):
-    """
-    Safely call any MPXJ getter method.
-    Catches ClassCastException and other Java errors
-    that occur when MPXJ encounters UUID or other
-    unexpected types internally.
-    """
-    try:
-        return func(*args) if args else func()
-    except Exception:
-        return None
 
+# --- Helpers ---
 
-def _safe_val(val):
-    """
-    Convert any Java value to a JSON-safe Python type.
-    Handles: UUID, Duration, enums, RtfNotes, etc.
-    """
+def _safe_str(val):
+    """Safely convert any Java/Python value to string, handling UUID and other non-String types."""
     if val is None:
         return None
     try:
-        class_name = str(val.getClass().getName())
+        return str(val)
     except Exception:
-        return str(val) if val is not None else None
+        pass
+    try:
+        return val.toString()
+    except Exception:
+        pass
+    try:
+        return repr(val)
+    except Exception:
+        return None
 
-    # java.util.UUID → string
-    if 'UUID' in class_name or 'uuid' in class_name:
-        return str(val)
-
-    # MPXJ Duration → "5.0d"
-    if 'Duration' in class_name and hasattr(val, 'getDuration'):
-        return _dur(val)
-
-    # MPXJ enums (TaskType, ConstraintType, Priority, AccrueType, etc.)
-    if class_name.startswith('net.sf.mpxj.') or class_name.startswith('org.mpxj.'):
-        return str(val)
-
-    # Standard Java types — return as-is (JPype handles conversion)
-    return val
-
-
-# --- Helpers ---
 
 def _jdate(val):
     """Java date -> ISO string or None."""
@@ -90,7 +66,8 @@ def _jdate(val):
         return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
     except Exception:
         try:
-            return str(val)[:10]
+            s = _safe_str(val)
+            return s[:10] if s else None
         except Exception:
             return None
 
@@ -100,7 +77,10 @@ def _s(val):
     if val is None:
         return None
     try:
-        s = str(val).strip()
+        s = _safe_str(val)
+        if s is None:
+            return None
+        s = s.strip()
         return s if s else None
     except Exception:
         return None
@@ -111,7 +91,7 @@ def _f(val):
     if val is None:
         return None
     try:
-        return float(str(val))
+        return float(_safe_str(val))
     except (ValueError, TypeError):
         return None
 
@@ -121,8 +101,8 @@ def _i(val):
     if val is None:
         return None
     try:
-        return int(str(val).split(".")[0])
-    except (ValueError, TypeError):
+        return int(_safe_str(val).split(".")[0])
+    except (ValueError, TypeError, AttributeError):
         return None
 
 
@@ -132,7 +112,7 @@ def _dur(val):
         return None
     try:
         amount = val.getDuration()
-        units = str(val.getUnits())
+        units = _safe_str(val.getUnits())
         umap = {
             "DAYS": "d", "HOURS": "h", "WEEKS": "w",
             "MONTHS": "mo", "MINUTES": "min", "YEARS": "y",
@@ -140,7 +120,7 @@ def _dur(val):
         }
         return str(amount) + umap.get(units, units)
     except Exception:
-        return str(val)
+        return _safe_str(val)
 
 
 def _preds(task):
@@ -151,12 +131,15 @@ def _preds(task):
         if rels is None:
             return out
         for rel in rels:
-            pt = _safe_call(rel.getTargetTask)
-            out.append({
-                "task_uid": _i(pt.getUniqueID()) if pt else None,
-                "type": _s(rel.getType()),
-                "lag": _dur(_safe_call(rel.getLag)),
-            })
+            try:
+                pt = rel.getTargetTask()
+                out.append({
+                    "task_uid": _i(pt.getUniqueID()) if pt else None,
+                    "type": _s(rel.getType()),
+                    "lag": _dur(rel.getLag()),
+                })
+            except Exception:
+                pass
     except Exception:
         pass
     return out
@@ -167,14 +150,17 @@ def _resources(task):
     out = []
     try:
         for ra in task.getResourceAssignments():
-            res = _safe_call(ra.getResource)
-            out.append({
-                "resource_name": _s(res.getName()) if res else None,
-                "resource_uid": _i(res.getUniqueID()) if res else None,
-                "work": _dur(_safe_call(ra.getWork)),
-                "units": _f(_safe_call(ra.getUnits)),
-                "cost": _f(_safe_call(ra.getCost)),
-            })
+            try:
+                res = ra.getResource()
+                out.append({
+                    "resource_name": _s(res.getName()) if res else None,
+                    "resource_uid": _i(res.getUniqueID()) if res else None,
+                    "work": _dur(ra.getWork()),
+                    "units": _f(ra.getUnits()),
+                    "cost": _f(ra.getCost()),
+                })
+            except Exception:
+                pass
     except Exception:
         pass
     return out
@@ -182,7 +168,7 @@ def _resources(task):
 
 def _notes(task):
     try:
-        n = _safe_call(task.getNotes)
+        n = task.getNotes()
         return _s(n)
     except Exception:
         return None
@@ -223,10 +209,9 @@ def _custom_texts(task, count=5):
                 field = TaskField.valueOf("TEXT" + str(i))
                 val = task.getCachedValue(field)
                 if val is not None:
-                    # FIX: use _safe_val to handle UUID/enum types in custom fields
-                    converted = _safe_val(val)
-                    if converted is not None:
-                        result["text" + str(i)] = str(converted).strip()
+                    s = _safe_str(val)
+                    if s:
+                        result["text" + str(i)] = s.strip()
             except Exception:
                 pass
     except Exception:
@@ -246,60 +231,68 @@ def parse_mpp(file_path):
         raise ValueError("MPXJ returned None. File may be corrupt.")
 
     props = project.getProjectProperties()
-    project_name = _s(_safe_call(props.getProjectTitle)) or _s(_safe_call(props.getName)) or "Untitled"
-    status_date = _jdate(_safe_call(props.getStatusDate))
-    start_date = _jdate(_safe_call(props.getStartDate))
-    finish_date = _jdate(_safe_call(props.getFinishDate))
+
+    project_name = _s(props.getProjectTitle()) or _s(props.getName()) or "Untitled"
+    status_date = _jdate(props.getStatusDate())
+    start_date = _jdate(props.getStartDate())
+    finish_date = _jdate(props.getFinishDate())
 
     tasks_out = []
     for task in project.getTasks():
-        uid = _i(_safe_call(task.getUniqueID))
+        uid = _i(task.getUniqueID())
         if uid is None or uid == 0:
             continue
 
-        summary = _is_summary(task)
-        milestone = _is_milestone(task)
+        try:
+            summary = _is_summary(task)
+            milestone = _is_milestone(task)
 
-        t = {
-            "unique_id":        uid,
-            "id":               _i(_safe_call(task.getID)),
-            "wbs":              _s(_safe_call(task.getWBS)),
-            "name":             _s(_safe_call(task.getName)),
-            "outline_level":    _i(_safe_call(task.getOutlineLevel)),
-            "parent_uid":       _parent_uid(task),
-            "is_summary":       summary,
-            "is_milestone":     milestone,
-            "start":            _jdate(_safe_call(task.getStart)),
-            "finish":           _jdate(_safe_call(task.getFinish)),
-            "baseline_start":   _jdate(_safe_call(task.getBaselineStart)),
-            "baseline_finish":  _jdate(_safe_call(task.getBaselineFinish)),
-            "duration":         _dur(_safe_call(task.getDuration)),
-            "percent_complete": _f(_safe_call(task.getPercentageComplete)),
-            "actual_start":     _jdate(_safe_call(task.getActualStart)),
-            "actual_finish":    _jdate(_safe_call(task.getActualFinish)),
-            "cost":             _f(_safe_call(task.getCost)),
-            "baseline_cost":    _f(_safe_call(task.getBaselineCost)),
-            "work":             _dur(_safe_call(task.getWork)),
-            "baseline_work":    _dur(_safe_call(task.getBaselineWork)),
-            "predecessors":     _preds(task),
-            "resources":        _resources(task),
-            "notes":            _notes(task),
-            "custom_fields":    _custom_texts(task),
-        }
-        tasks_out.append(t)
+            t = {
+                "unique_id": uid,
+                "id": _i(task.getID()),
+                "wbs": _s(task.getWBS()),
+                "name": _s(task.getName()),
+                "outline_level": _i(task.getOutlineLevel()),
+                "parent_uid": _parent_uid(task),
+                "is_summary": summary,
+                "is_milestone": milestone,
+                "start": _jdate(task.getStart()),
+                "finish": _jdate(task.getFinish()),
+                "baseline_start": _jdate(task.getBaselineStart()),
+                "baseline_finish": _jdate(task.getBaselineFinish()),
+                "duration": _dur(task.getDuration()),
+                "percent_complete": _f(task.getPercentageComplete()),
+                "actual_start": _jdate(task.getActualStart()),
+                "actual_finish": _jdate(task.getActualFinish()),
+                "cost": _f(task.getCost()),
+                "baseline_cost": _f(task.getBaselineCost()),
+                "work": _dur(task.getWork()),
+                "baseline_work": _dur(task.getBaselineWork()),
+                "predecessors": _preds(task),
+                "resources": _resources(task),
+                "notes": _notes(task),
+                "custom_fields": _custom_texts(task),
+            }
+            tasks_out.append(t)
+        except Exception as e:
+            print(f"WARN: skipping task UID={uid}: {e}")
+            continue
 
     resources_out = []
     try:
         for res in project.getResources():
-            ruid = _i(_safe_call(res.getUniqueID))
-            if ruid is None or ruid == 0:
-                continue
-            resources_out.append({
-                "unique_id": ruid,
-                "name": _s(_safe_call(res.getName)),
-                "type": _s(_safe_call(res.getType)),
-                "cost": _f(_safe_call(res.getCost)),
-            })
+            try:
+                ruid = _i(res.getUniqueID())
+                if ruid is None or ruid == 0:
+                    continue
+                resources_out.append({
+                    "unique_id": ruid,
+                    "name": _s(res.getName()),
+                    "type": _s(res.getType()),
+                    "cost": _f(res.getCost()),
+                })
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -309,20 +302,20 @@ def parse_mpp(file_path):
     bl = sum(1 for t in tasks_out if t["baseline_finish"] is not None)
 
     return {
-        "project_name":    project_name,
-        "status_date":     status_date,
-        "start_date":      start_date,
-        "finish_date":     finish_date,
+        "project_name": project_name,
+        "status_date": status_date,
+        "start_date": start_date,
+        "finish_date": finish_date,
         "parse_timestamp": datetime.utcnow().isoformat() + "Z",
         "summary": {
-            "total_tasks":     total,
-            "summary_tasks":   sm,
-            "milestones":      ml,
-            "leaf_tasks":      total - sm - ml,
-            "with_baseline":   bl,
+            "total_tasks": total,
+            "summary_tasks": sm,
+            "milestones": ml,
+            "leaf_tasks": total - sm - ml,
+            "with_baseline": bl,
             "total_resources": len(resources_out),
         },
-        "tasks":     tasks_out,
+        "tasks": tasks_out,
         "resources": resources_out,
     }
 
@@ -355,10 +348,8 @@ async def parse_endpoint(file: UploadFile = File(...)):
         tmp.write(content)
         tmp.flush()
         tmp.close()
-
         result = parse_mpp(tmp.name)
         return JSONResponse(content=result)
-
     except ValueError as ve:
         raise HTTPException(422, str(ve))
     except Exception as e:
@@ -402,45 +393,46 @@ async def parse_compact(file: UploadFile = File(...)):
                 for r in (t.get("resources") or [])
             )
             custom = t.get("custom_fields") or {}
+
             row = {
-                "UID":            t["unique_id"],
-                "ID":             t["id"],
-                "WBS":            t["wbs"] or "",
-                "Name":           t["name"] or "",
-                "Level":          custom.get("text1", ""),
-                "Outline":        t["outline_level"],
-                "Parent_UID":     t["parent_uid"] or "",
-                "Summary":        "Y" if t["is_summary"] else "N",
-                "Milestone":      "Y" if t["is_milestone"] else "N",
-                "Start":          t["start"] or "",
-                "Finish":         t["finish"] or "",
+                "UID": t["unique_id"],
+                "ID": t["id"],
+                "WBS": t["wbs"] or "",
+                "Name": t["name"] or "",
+                "Level": custom.get("text1", ""),
+                "Outline": t["outline_level"],
+                "Parent_UID": t["parent_uid"] or "",
+                "Summary": "Y" if t["is_summary"] else "N",
+                "Milestone": "Y" if t["is_milestone"] else "N",
+                "Start": t["start"] or "",
+                "Finish": t["finish"] or "",
                 "Baseline_Start": t["baseline_start"] or "",
-                "Baseline_Finish":t["baseline_finish"] or "",
-                "Duration":       t["duration"] or "",
-                "Pct_Complete":   t["percent_complete"] or 0,
-                "Actual_Start":   t["actual_start"] or "",
-                "Actual_Finish":  t["actual_finish"] or "",
-                "Cost":           t["cost"] or "",
-                "Baseline_Cost":  t["baseline_cost"] or "",
-                "Work":           t["work"] or "",
-                "Baseline_Work":  t["baseline_work"] or "",
-                "Predecessors":   pred_str,
-                "Resources":      res_str,
-                "Notes":          t["notes"] or "",
+                "Baseline_Finish": t["baseline_finish"] or "",
+                "Duration": t["duration"] or "",
+                "Pct_Complete": t["percent_complete"] or 0,
+                "Actual_Start": t["actual_start"] or "",
+                "Actual_Finish": t["actual_finish"] or "",
+                "Cost": t["cost"] or "",
+                "Baseline_Cost": t["baseline_cost"] or "",
+                "Work": t["work"] or "",
+                "Baseline_Work": t["baseline_work"] or "",
+                "Predecessors": pred_str,
+                "Resources": res_str,
+                "Notes": t["notes"] or "",
             }
             rows.append(row)
 
         columns = list(rows[0].keys()) if rows else []
 
         return JSONResponse(content={
-            "project_name":    full["project_name"],
-            "status_date":     full["status_date"],
-            "start_date":      full["start_date"],
-            "finish_date":     full["finish_date"],
+            "project_name": full["project_name"],
+            "status_date": full["status_date"],
+            "start_date": full["start_date"],
+            "finish_date": full["finish_date"],
             "parse_timestamp": full["parse_timestamp"],
-            "summary":         full["summary"],
-            "columns":         columns,
-            "rows":            rows,
+            "summary": full["summary"],
+            "columns": columns,
+            "rows": rows,
         })
 
     except ValueError as ve:
