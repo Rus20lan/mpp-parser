@@ -1,5 +1,11 @@
 """
 MPP Parser Microservice — JPype + MPXJ (Maven JARs)
+
+Fixes:
+- Works with MPXJ 15.x package: org.mpxj
+- Keeps fallback for legacy package: net.sf.mpxj
+- Does not import Java classes before JVM startup
+- Uses jpype.JClass instead of Python-style Java imports for better reliability
 """
 
 import os
@@ -21,7 +27,7 @@ MPXJ_LIB_DIR = os.getenv("MPXJ_LIB_DIR", "/app/lib")
 
 app = FastAPI(
     title="MPP Parser for R&D Change Log",
-    version="1.3.1",
+    version="1.3.2",
 )
 
 app.add_middleware(
@@ -38,9 +44,7 @@ def _find_jars():
     """
     Find MPXJ jars and dependencies.
 
-    If /app/lib is empty, JPype can start, but import like:
-    from net.sf.mpxj.reader import UniversalProjectReader
-    will fail with: Java package 'net' not found.
+    If /app/lib is empty, JPype can start, but MPXJ classes will not be visible.
     """
     jars = glob.glob(os.path.join(MPXJ_LIB_DIR, "*.jar"))
     return sorted(jars)
@@ -77,29 +81,76 @@ def start_jvm():
 
 def get_mpxj_classes():
     """
-    Import Java classes only after JVM is started with MPXJ classpath.
+    Load Java classes after JVM startup.
+
+    MPXJ 15.x uses:
+        org.mpxj.reader.UniversalProjectReader
+
+    Older MPXJ versions used:
+        net.sf.mpxj.reader.UniversalProjectReader
+    """
+    start_jvm()
+
+    errors = []
+
+    try:
+        UniversalProjectReader = jpype.JClass(
+            "org.mpxj.reader.UniversalProjectReader"
+        )
+        FileInputStream = jpype.JClass("java.io.FileInputStream")
+
+        return UniversalProjectReader, FileInputStream
+
+    except Exception as exc:
+        errors.append(f"org.mpxj failed: {exc}")
+
+    try:
+        UniversalProjectReader = jpype.JClass(
+            "net.sf.mpxj.reader.UniversalProjectReader"
+        )
+        FileInputStream = jpype.JClass("java.io.FileInputStream")
+
+        return UniversalProjectReader, FileInputStream
+
+    except Exception as exc:
+        errors.append(f"net.sf.mpxj failed: {exc}")
+
+    jars = _find_jars()
+    mpxj_jars = [
+        os.path.basename(j)
+        for j in jars
+        if "mpxj" in os.path.basename(j).lower()
+    ]
+
+    raise RuntimeError(
+        "JVM is running, but MPXJ UniversalProjectReader is not visible. "
+        "Tried both 'org.mpxj.reader.UniversalProjectReader' and "
+        "'net.sf.mpxj.reader.UniversalProjectReader'. "
+        f"jar_count={len(jars)}, mpxj_jars={mpxj_jars}, errors={errors}"
+    )
+
+
+def get_task_field_class():
+    """
+    Load TaskField class for custom fields.
+
+    MPXJ 15.x:
+        org.mpxj.TaskField
+
+    Legacy MPXJ:
+        net.sf.mpxj.TaskField
     """
     start_jvm()
 
     try:
-        from net.sf.mpxj.reader import UniversalProjectReader  # type: ignore
-        from java.io import FileInputStream  # type: ignore
+        return jpype.JClass("org.mpxj.TaskField")
+    except Exception:
+        pass
 
-        return UniversalProjectReader, FileInputStream
-
-    except ImportError as exc:
-        jars = _find_jars()
-        mpxj_jars = [
-            os.path.basename(j)
-            for j in jars
-            if "mpxj" in os.path.basename(j).lower()
-        ]
-
-        raise RuntimeError(
-            "JVM is running, but MPXJ Java package 'net.sf.mpxj' is not visible. "
-            f"jar_count={len(jars)}, mpxj_jars={mpxj_jars}. "
-            "Check that net.sf.mpxj:mpxj and dependencies are copied to /app/lib."
-        ) from exc
+    try:
+        return jpype.JClass("net.sf.mpxj.TaskField")
+    except Exception:
+        return None
 
 
 # --- Helpers ---
@@ -155,6 +206,7 @@ def _s(val):
 
     try:
         s = _safe_str(val)
+
         if s is None:
             return None
 
@@ -321,7 +373,10 @@ def _custom_texts(task, count=5):
     result = {}
 
     try:
-        from net.sf.mpxj import TaskField  # type: ignore
+        TaskField = get_task_field_class()
+
+        if TaskField is None:
+            return result
 
         for i in range(1, count + 1):
             try:
@@ -464,7 +519,7 @@ def parse_mpp(file_path):
 async def root():
     return {
         "service": "MPP Parser",
-        "version": "1.3.1",
+        "version": "1.3.2",
         "status": "running",
     }
 
@@ -472,6 +527,7 @@ async def root():
 @app.get("/health")
 async def health():
     jars = _find_jars()
+
     mpxj_jars = [
         os.path.basename(j)
         for j in jars
@@ -490,12 +546,16 @@ async def health():
 @app.get("/health/deep")
 async def health_deep():
     try:
-        get_mpxj_classes()
+        UniversalProjectReader, FileInputStream = get_mpxj_classes()
+        TaskField = get_task_field_class()
 
         return {
             "status": "ok",
             "jvm": jpype.isJVMStarted(),
             "mpxj_import": True,
+            "universal_reader": str(UniversalProjectReader),
+            "file_input_stream": str(FileInputStream),
+            "task_field": str(TaskField) if TaskField is not None else None,
             "jar_count": len(_find_jars()),
         }
 
