@@ -12,9 +12,9 @@ WORKDIR /app
 # Download MPXJ + all transitive dependencies via Maven
 RUN mkdir -p /app/lib && \
     cd /tmp && \
-    echo '<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId><artifactId>t</artifactId><version>1</version><dependencies><dependency><groupId>net.sf.mpxj</groupId><artifactId>mpxj</artifactId><version>13.4.0</version></dependency></dependencies></project>' > pom.xml && \
+    echo '<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId><artifactId>t</artifactId><version>1</version><dependencies><dependency><groupId>net.sf.mpxj</groupId><artifactId>mpxj</artifactId><version>15.3.1</version></dependency></dependencies></project>' > pom.xml && \
     mvn dependency:copy-dependencies -DoutputDirectory=/app/lib -q && \
-    mvn dependency:copy -Dartifact=net.sf.mpxj:mpxj:13.8.0 -DoutputDirectory=/app/lib -q && \
+    mvn dependency:copy -Dartifact=net.sf.mpxj:mpxj:15.3.1 -DoutputDirectory=/app/lib -q && \
     rm -rf /tmp/pom.xml /root/.m2 && \
     apt-get purge -y maven && apt-get autoremove -y
 
