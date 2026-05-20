@@ -7,7 +7,6 @@ import glob
 import tempfile
 import traceback
 from datetime import datetime
-from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -16,17 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import jpype
 import jpype.imports
 
-# Start JVM with all JARs from /app/lib/
-if not jpype.isJVMStarted():
-    jars = glob.glob("/app/lib/*.jar")
-    jpype.startJVM(classpath=jars, convertStrings=True)
 
-from net.sf.mpxj.reader import UniversalProjectReader  # type: ignore
-from java.io import FileInputStream  # type: ignore
+MPXJ_LIB_DIR = os.getenv("MPXJ_LIB_DIR", "/app/lib")
+
 
 app = FastAPI(
     title="MPP Parser for R&D Change Log",
-    version="1.3.0",
+    version="1.3.1",
 )
 
 app.add_middleware(
@@ -37,20 +32,96 @@ app.add_middleware(
 )
 
 
+# --- JVM / MPXJ bootstrap ---
+
+def _find_jars():
+    """
+    Find MPXJ jars and dependencies.
+
+    If /app/lib is empty, JPype can start, but import like:
+    from net.sf.mpxj.reader import UniversalProjectReader
+    will fail with: Java package 'net' not found.
+    """
+    jars = glob.glob(os.path.join(MPXJ_LIB_DIR, "*.jar"))
+    return sorted(jars)
+
+
+def start_jvm():
+    """
+    Start JVM once with all MPXJ jars in classpath.
+    """
+    if jpype.isJVMStarted():
+        return
+
+    jars = _find_jars()
+
+    if not jars:
+        raise RuntimeError(
+            f"MPXJ jars not found in {MPXJ_LIB_DIR}. "
+            "Check Dockerfile Maven dependency download step."
+        )
+
+    mpxj_jars = [
+        j for j in jars
+        if "mpxj" in os.path.basename(j).lower()
+    ]
+
+    if not mpxj_jars:
+        raise RuntimeError(
+            f"MPXJ main jar not found in {MPXJ_LIB_DIR}. "
+            f"Found jars: {jars}"
+        )
+
+    jpype.startJVM(classpath=jars, convertStrings=True)
+
+
+def get_mpxj_classes():
+    """
+    Import Java classes only after JVM is started with MPXJ classpath.
+    """
+    start_jvm()
+
+    try:
+        from net.sf.mpxj.reader import UniversalProjectReader  # type: ignore
+        from java.io import FileInputStream  # type: ignore
+
+        return UniversalProjectReader, FileInputStream
+
+    except ImportError as exc:
+        jars = _find_jars()
+        mpxj_jars = [
+            os.path.basename(j)
+            for j in jars
+            if "mpxj" in os.path.basename(j).lower()
+        ]
+
+        raise RuntimeError(
+            "JVM is running, but MPXJ Java package 'net.sf.mpxj' is not visible. "
+            f"jar_count={len(jars)}, mpxj_jars={mpxj_jars}. "
+            "Check that net.sf.mpxj:mpxj and dependencies are copied to /app/lib."
+        ) from exc
+
+
 # --- Helpers ---
 
 def _safe_str(val):
-    """Safely convert any Java/Python value to string, handling UUID and other non-String types."""
+    """
+    Safely convert any Java/Python value to string,
+    handling UUID and other non-String types.
+    """
     if val is None:
         return None
+
     try:
         return str(val)
     except Exception:
         pass
+
     try:
         return val.toString()
     except Exception:
         pass
+
     try:
         return repr(val)
     except Exception:
@@ -58,9 +129,12 @@ def _safe_str(val):
 
 
 def _jdate(val):
-    """Java date -> ISO string or None."""
+    """
+    Java date -> ISO string or None.
+    """
     if val is None:
         return None
+
     try:
         ts = val.getTime() / 1000.0
         return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
@@ -73,23 +147,31 @@ def _jdate(val):
 
 
 def _s(val):
-    """Java/Python value -> stripped string or None."""
+    """
+    Java/Python value -> stripped string or None.
+    """
     if val is None:
         return None
+
     try:
         s = _safe_str(val)
         if s is None:
             return None
+
         s = s.strip()
         return s if s else None
+
     except Exception:
         return None
 
 
 def _f(val):
-    """Value -> float or None."""
+    """
+    Value -> float or None.
+    """
     if val is None:
         return None
+
     try:
         return float(_safe_str(val))
     except (ValueError, TypeError):
@@ -97,9 +179,12 @@ def _f(val):
 
 
 def _i(val):
-    """Value -> int or None."""
+    """
+    Value -> int or None.
+    """
     if val is None:
         return None
+
     try:
         return int(_safe_str(val).split(".")[0])
     except (ValueError, TypeError, AttributeError):
@@ -107,51 +192,75 @@ def _i(val):
 
 
 def _dur(val):
-    """MPXJ Duration -> string like '5.0d'."""
+    """
+    MPXJ Duration -> string like '5.0d'.
+    """
     if val is None:
         return None
+
     try:
         amount = val.getDuration()
         units = _safe_str(val.getUnits())
+
         umap = {
-            "DAYS": "d", "HOURS": "h", "WEEKS": "w",
-            "MONTHS": "mo", "MINUTES": "min", "YEARS": "y",
-            "ELAPSED_DAYS": "ed", "ELAPSED_HOURS": "eh",
+            "DAYS": "d",
+            "HOURS": "h",
+            "WEEKS": "w",
+            "MONTHS": "mo",
+            "MINUTES": "min",
+            "YEARS": "y",
+            "ELAPSED_DAYS": "ed",
+            "ELAPSED_HOURS": "eh",
         }
+
         return str(amount) + umap.get(units, units)
+
     except Exception:
         return _safe_str(val)
 
 
 def _preds(task):
-    """Extract predecessor list."""
+    """
+    Extract predecessor list.
+    """
     out = []
+
     try:
         rels = task.getPredecessors()
+
         if rels is None:
             return out
+
         for rel in rels:
             try:
                 pt = rel.getTargetTask()
+
                 out.append({
                     "task_uid": _i(pt.getUniqueID()) if pt else None,
                     "type": _s(rel.getType()),
                     "lag": _dur(rel.getLag()),
                 })
+
             except Exception:
                 pass
+
     except Exception:
         pass
+
     return out
 
 
 def _resources(task):
-    """Extract resource assignments."""
+    """
+    Extract resource assignments.
+    """
     out = []
+
     try:
         for ra in task.getResourceAssignments():
             try:
                 res = ra.getResource()
+
                 out.append({
                     "resource_name": _s(res.getName()) if res else None,
                     "resource_uid": _i(res.getUniqueID()) if res else None,
@@ -159,10 +268,13 @@ def _resources(task):
                     "units": _f(ra.getUnits()),
                     "cost": _f(ra.getCost()),
                 })
+
             except Exception:
                 pass
+
     except Exception:
         pass
+
     return out
 
 
@@ -192,40 +304,57 @@ def _is_milestone(task):
 def _parent_uid(task):
     try:
         p = task.getParentTask()
+
         if p is not None:
             return _i(p.getUniqueID())
+
     except Exception:
         pass
+
     return None
 
 
 def _custom_texts(task, count=5):
-    """Read Text1..TextN custom fields."""
+    """
+    Read Text1..TextN custom fields.
+    """
     result = {}
+
     try:
         from net.sf.mpxj import TaskField  # type: ignore
+
         for i in range(1, count + 1):
             try:
                 field = TaskField.valueOf("TEXT" + str(i))
                 val = task.getCachedValue(field)
+
                 if val is not None:
                     s = _safe_str(val)
+
                     if s:
                         result["text" + str(i)] = s.strip()
+
             except Exception:
                 pass
+
     except Exception:
         pass
+
     return result
 
 
 # --- Core parse ---
 
 def parse_mpp(file_path):
+    UniversalProjectReader, FileInputStream = get_mpxj_classes()
+
     reader = UniversalProjectReader()
     fis = FileInputStream(file_path)
-    project = reader.read(fis)
-    fis.close()
+
+    try:
+        project = reader.read(fis)
+    finally:
+        fis.close()
 
     if project is None:
         raise ValueError("MPXJ returned None. File may be corrupt.")
@@ -238,8 +367,10 @@ def parse_mpp(file_path):
     finish_date = _jdate(props.getFinishDate())
 
     tasks_out = []
+
     for task in project.getTasks():
         uid = _i(task.getUniqueID())
+
         if uid is None or uid == 0:
             continue
 
@@ -273,26 +404,33 @@ def parse_mpp(file_path):
                 "notes": _notes(task),
                 "custom_fields": _custom_texts(task),
             }
+
             tasks_out.append(t)
+
         except Exception as e:
             print(f"WARN: skipping task UID={uid}: {e}")
             continue
 
     resources_out = []
+
     try:
         for res in project.getResources():
             try:
                 ruid = _i(res.getUniqueID())
+
                 if ruid is None or ruid == 0:
                     continue
+
                 resources_out.append({
                     "unique_id": ruid,
                     "name": _s(res.getName()),
                     "type": _s(res.getType()),
                     "cost": _f(res.getCost()),
                 })
+
             except Exception:
                 pass
+
     except Exception:
         pass
 
@@ -324,12 +462,54 @@ def parse_mpp(file_path):
 
 @app.get("/")
 async def root():
-    return {"service": "MPP Parser", "version": "1.3.0", "status": "running"}
+    return {
+        "service": "MPP Parser",
+        "version": "1.3.1",
+        "status": "running",
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "jvm": jpype.isJVMStarted()}
+    jars = _find_jars()
+    mpxj_jars = [
+        os.path.basename(j)
+        for j in jars
+        if "mpxj" in os.path.basename(j).lower()
+    ]
+
+    return {
+        "status": "ok",
+        "jvm": jpype.isJVMStarted(),
+        "lib_dir": MPXJ_LIB_DIR,
+        "jar_count": len(jars),
+        "mpxj_jars": mpxj_jars,
+    }
+
+
+@app.get("/health/deep")
+async def health_deep():
+    try:
+        get_mpxj_classes()
+
+        return {
+            "status": "ok",
+            "jvm": jpype.isJVMStarted(),
+            "mpxj_import": True,
+            "jar_count": len(_find_jars()),
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "jvm": jpype.isJVMStarted(),
+                "mpxj_import": False,
+                "error": str(e),
+                "jar_count": len(_find_jars()),
+            },
+        )
 
 
 @app.post("/parse")
@@ -339,22 +519,29 @@ async def parse_endpoint(file: UploadFile = File(...)):
 
     allowed = (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml")
     ext = os.path.splitext(file.filename)[1].lower()
+
     if ext not in allowed:
         raise HTTPException(400, "Unsupported: " + ext)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+
     try:
         content = await file.read()
         tmp.write(content)
         tmp.flush()
         tmp.close()
+
         result = parse_mpp(tmp.name)
+
         return JSONResponse(content=result)
+
     except ValueError as ve:
         raise HTTPException(422, str(ve))
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, "Parse error: " + str(e))
+
     finally:
         try:
             os.unlink(tmp.name)
@@ -369,10 +556,12 @@ async def parse_compact(file: UploadFile = File(...)):
 
     allowed = (".mpp", ".mpt", ".mpx", ".xml", ".xer", ".pmxml")
     ext = os.path.splitext(file.filename)[1].lower()
+
     if ext not in allowed:
         raise HTTPException(400, "Unsupported: " + ext)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+
     try:
         content = await file.read()
         tmp.write(content)
@@ -382,16 +571,19 @@ async def parse_compact(file: UploadFile = File(...)):
         full = parse_mpp(tmp.name)
 
         rows = []
+
         for t in full["tasks"]:
             pred_str = ", ".join(
                 str(p["task_uid"])
                 for p in (t.get("predecessors") or [])
                 if p.get("task_uid") is not None
             )
+
             res_str = ", ".join(
                 r.get("resource_name") or ""
                 for r in (t.get("resources") or [])
             )
+
             custom = t.get("custom_fields") or {}
 
             row = {
@@ -420,6 +612,7 @@ async def parse_compact(file: UploadFile = File(...)):
                 "Resources": res_str,
                 "Notes": t["notes"] or "",
             }
+
             rows.append(row)
 
         columns = list(rows[0].keys()) if rows else []
@@ -437,9 +630,11 @@ async def parse_compact(file: UploadFile = File(...)):
 
     except ValueError as ve:
         raise HTTPException(422, str(ve))
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, "Parse error: " + str(e))
+
     finally:
         try:
             os.unlink(tmp.name)
